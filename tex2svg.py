@@ -15,46 +15,72 @@ def find_equations(tex_file):
         equations += re.findall(r'\\begin{multline}(.*?)\\begin{multline}', tex_content, re.DOTALL)
         return equations
     
+def has_balanced_brackets(command):
+    return command.count('{') == command.count('}')
+
+def extract_command_with_content(command_start, preamble):
+    """Extracts the full command definition starting from command_start."""
+    start_index = command_start
+    end_index = start_index
+    count_open_brackets = 0
+
+    for i, char in enumerate(preamble[start_index:]):
+        if char == '{':
+            count_open_brackets += 1
+        elif char == '}':
+            count_open_brackets -= 1
+        if count_open_brackets == 0:
+            end_index = start_index + i
+            break
+    else:  # if the loop completes without finding a closing bracket
+        return None
+
+    return preamble[start_index:end_index + 1]
+
 def extract_relevant_commands(preamble):
     relevant_content = ''
     
     # Extracting non-commented \usepackage commands
     usepackage_matches = [match for match in re.findall(r'(?<!^%)\\usepackage.*?\n', preamble, re.MULTILINE) if not match.strip().startswith('%')]
-    if usepackage_matches:
-        relevant_content += '\n'.join(usepackage_matches) + '\n'
+    relevant_content += '\n'.join(usepackage_matches) + '\n'
     
     # Extracting new/renew/provide command definitions including \newcommand* variant
     command_definitions_patterns = [
-        r'(?<!^%)\\newcommand\*?.*?{.*?}.*?\n',
-        r'(?<!^%)\\renewcommand\*?.*?{.*?}.*?\n',
-        r'(?<!^%)\\providecommand\*?.*?{.*?}.*?\n',
-        r'(?<!^%)\\def.*?{.*?}.*?\n',
-        r'(?<!^%)\\let.*?=.*?\n'
+        r'\\newcommand\*?',
+        r'\\renewcommand\*?',
+        r'\\providecommand\*?',
+        r'\\let'
     ]
+
     for pattern in command_definitions_patterns:
-        matches = re.findall(pattern, preamble, re.DOTALL | re.MULTILINE)
-        if matches:
-            relevant_content += ''.join(matches)
+        matches = [m.start() for m in re.finditer(pattern, preamble)]
+        for match_start in matches:
+            full_command = extract_command_with_content(match_start, preamble)
+            if full_command.strip() != '\\':  # Ensure we aren't just adding a standalone backslash
+                relevant_content += full_command + '\n'
     
     # Extracting new/renew environment definitions
     environment_definitions_patterns = [
-        r'(?<!^%)\\newenvironment.*?{.*?}{.*?}\n',
-        r'(?<!^%)\\renewenvironment.*?{.*?}{.*?}\n'
+        r'\\newenvironment',
+        r'\\renewenvironment'
     ]
-    for pattern in environment_definitions_patterns:
-        matches = re.findall(pattern, preamble, re.DOTALL | re.MULTILINE)
-        if matches:
-            relevant_content += ''.join(matches)
+
+    for pattern in command_definitions_patterns:
+        matches = [m.start() for m in re.finditer(pattern, preamble)]
+        for match_start in matches:
+            full_command = extract_command_with_content(match_start, preamble)
+            if full_command.strip() != '\\':  # Ensure we aren't just adding a standalone backslash
+                relevant_content += full_command + '\n'
     
     # Extracting DeclareMathOperator commands
     math_operator_definitions = [match for match in re.findall(r'(?<!^%)\\DeclareMathOperator.*?\n', preamble, re.MULTILINE) if not match.strip().startswith('%')]
-    if math_operator_definitions:
-        relevant_content += ''.join(math_operator_definitions)
+    relevant_content += '\n'.join(math_operator_definitions) + '\n'
     
     return relevant_content.strip()  # Using strip() to remove any leading or trailing newlines
 
 
-def create_equation_file(equation, output_dir, equation_index, newcommands, relevant_content):
+
+def create_equation_file(equation, output_dir, equation_index, relevant_content):
     equation_content = '\\documentclass[preview,varwidth]{standalone}\n'
     equation_content += relevant_content + '\n'
 
@@ -101,23 +127,31 @@ def compile_equation(equation_file):
     try:
         timer.start()
         run_pdflatex()
+        print(f'Equation {equation_basename} compiled successfully.')
+    except:
+        print(f'Equation {equation_basename} failed!')
     finally:
         timer.cancel()
         if process is not None:
+            
             process.kill()
 
-    print(f'Equation {equation_basename} compiled successfully.')
+
+    
     return equation_basename
 
-
 def convert_pdf_to_svg(pdf_file, svg_file, inkscape_path):
+    if os.path.exists(svg_file):
+        print(f"SVG file {svg_file} already exists. Skipping conversion.")
+        return
+    
     try:
         subprocess.run([inkscape_path, '--pdf-poppler', '--export-type=svg', '--export-filename=' + svg_file, pdf_file], check=True)
         print(f"Successfully converted {pdf_file} to SVG.")
     except subprocess.CalledProcessError as e:
         print(f"Failed to convert {pdf_file} to SVG. Error: {e}")
     except FileNotFoundError:
-        print("Inkscape executable not found. Please provide the correct path.")
+        print(f"Inkscape executable not found at path {inkscape_path}. Please provide the correct path .")
 
 
 if __name__ == "__main__":
@@ -157,7 +191,7 @@ if __name__ == "__main__":
 
         # Save each equation in a separate .tex file and compile to PDF
         for i, equation in enumerate(equations):
-            equation_file = create_equation_file(equation, output_dir, i, newcommands, relevant_content)
+            equation_file = create_equation_file(equation, output_dir, i, relevant_content)
             equation_basename = compile_equation(equation_file)
 
             # Set file permissions for the PDF file
@@ -170,12 +204,12 @@ if __name__ == "__main__":
             print('Inkscape executable is available in the system PATH.')
         except FileNotFoundError:
             inkscape_path = r'C:\Program Files\Inkscape\bin\inkscape.exe'  # Fallback to absolute path if 'inkscape' command is not found
-            print('The "inkscape" command is not available in the system path. Fallback to absolute path.')
+            print(f'The "inkscape" command is not available in the system path. Fallback to absolute path {inkscape_path}.')
 
         if os.path.exists(inkscape_path):
             print('Inkscape executable found.')
         else:
-            print('Inkscape executable not found at the specified path.')
+            print('Inkscape executable not found at the specified path {inkscape_path}.')
 
         try:
             subprocess.run([inkscape_path, '--version'], check=True)
