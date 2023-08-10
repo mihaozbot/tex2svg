@@ -9,16 +9,54 @@ def find_equations(tex_file):
     with open(tex_file, 'r') as file:
         tex_content = file.read()
         equations = re.findall(r'\\begin{equation}(.*?)\\end{equation}', tex_content, re.DOTALL)
+        equations += re.findall(r'\\\[([\s\S]*?)\\\]', tex_content, re.DOTALL)
+        equations += re.findall(r'\\begin{displaymath}(.*?)\\end{displaymath}', tex_content, re.DOTALL)
+        equations += re.findall(r'\\begin{align}(.*?)\\end{align}', tex_content, re.DOTALL)
+        equations += re.findall(r'\\begin{multline}(.*?)\\begin{multline}', tex_content, re.DOTALL)
         return equations
+    
+def extract_relevant_commands(preamble):
+    relevant_content = ''
+    
+    # Extracting non-commented \usepackage commands
+    usepackage_matches = [match for match in re.findall(r'(?<!^%)\\usepackage.*?\n', preamble, re.MULTILINE) if not match.strip().startswith('%')]
+    if usepackage_matches:
+        relevant_content += '\n'.join(usepackage_matches) + '\n'
+    
+    # Extracting new/renew/provide command definitions including \newcommand* variant
+    command_definitions_patterns = [
+        r'(?<!^%)\\newcommand\*?.*?{.*?}.*?\n',
+        r'(?<!^%)\\renewcommand\*?.*?{.*?}.*?\n',
+        r'(?<!^%)\\providecommand\*?.*?{.*?}.*?\n',
+        r'(?<!^%)\\def.*?{.*?}.*?\n',
+        r'(?<!^%)\\let.*?=.*?\n'
+    ]
+    for pattern in command_definitions_patterns:
+        matches = re.findall(pattern, preamble, re.DOTALL | re.MULTILINE)
+        if matches:
+            relevant_content += ''.join(matches)
+    
+    # Extracting new/renew environment definitions
+    environment_definitions_patterns = [
+        r'(?<!^%)\\newenvironment.*?{.*?}{.*?}\n',
+        r'(?<!^%)\\renewenvironment.*?{.*?}{.*?}\n'
+    ]
+    for pattern in environment_definitions_patterns:
+        matches = re.findall(pattern, preamble, re.DOTALL | re.MULTILINE)
+        if matches:
+            relevant_content += ''.join(matches)
+    
+    # Extracting DeclareMathOperator commands
+    math_operator_definitions = [match for match in re.findall(r'(?<!^%)\\DeclareMathOperator.*?\n', preamble, re.MULTILINE) if not match.strip().startswith('%')]
+    if math_operator_definitions:
+        relevant_content += ''.join(math_operator_definitions)
+    
+    return relevant_content.strip()  # Using strip() to remove any leading or trailing newlines
 
 
-def create_equation_file(equation, output_dir, equation_index, newcommands):
+def create_equation_file(equation, output_dir, equation_index, newcommands, relevant_content):
     equation_content = '\\documentclass[preview,varwidth]{standalone}\n'
-    equation_content += '\\usepackage{amsmath,amsfonts}\n'
-    equation_content += '\\usepackage[noabbrev]{cleveref}\n'
-
-    for newcommand in newcommands:
-        equation_content += newcommand.strip() + '\n'
+    equation_content += relevant_content + '\n'
 
     equation_content += '\\begin{document}\n'
 
@@ -103,6 +141,8 @@ if __name__ == "__main__":
         with open(tex_file, 'r') as file:
             tex_content = file.read()
             newcommands = re.findall(r'\\newcommand.*?\n', tex_content, re.DOTALL)
+            preamble = re.search(r'\\documentclass.*?\\begin{document}', tex_content, re.DOTALL).group()
+            relevant_content = extract_relevant_commands(preamble)
 
         # Create the output directory
         if output_folder is None:
@@ -117,7 +157,7 @@ if __name__ == "__main__":
 
         # Save each equation in a separate .tex file and compile to PDF
         for i, equation in enumerate(equations):
-            equation_file = create_equation_file(equation, output_dir, i, newcommands)
+            equation_file = create_equation_file(equation, output_dir, i, newcommands, relevant_content)
             equation_basename = compile_equation(equation_file)
 
             # Set file permissions for the PDF file
