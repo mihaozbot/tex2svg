@@ -6,15 +6,22 @@ import threading
 import sys
 
 def find_equations(tex_file):
-    with open(tex_file, 'r') as file:
-        tex_content = file.read()
-        equations = re.findall(r'\\begin{equation}(.*?)\\end{equation}', tex_content, re.DOTALL)
-        equations += re.findall(r'\\\[([\s\S]*?)\\\]', tex_content, re.DOTALL)
-        equations += re.findall(r'\\begin{displaymath}(.*?)\\end{displaymath}', tex_content, re.DOTALL)
-        equations += re.findall(r'\\begin{align}(.*?)\\end{align}', tex_content, re.DOTALL)
-        equations += re.findall(r'\\begin{multline}(.*?)\\begin{multline}', tex_content, re.DOTALL)
-        return equations
-    
+    try:
+        with open(tex_file, 'r', encoding='utf-8', errors='ignore') as file:  # Use 'ignore' to skip invalid characters
+            tex_content = file.read()
+    except (UnicodeDecodeError, IOError) as e:
+        print(f"Error reading {tex_file}: {e}")
+        return []  # Skip this file and return an empty list
+
+    # Extract equations
+    equations = re.findall(r'\\begin{equation}(.*?)\\end{equation}', tex_content, re.DOTALL)
+    equations += re.findall(r'\\\[([\s\S]*?)\\\]', tex_content, re.DOTALL)
+    equations += re.findall(r'\\begin{displaymath}(.*?)\\end{displaymath}', tex_content, re.DOTALL)
+    equations += re.findall(r'\\begin{align}(.*?)\\end{align}', tex_content, re.DOTALL)
+    equations += re.findall(r'\\begin{multline}(.*?)\\begin{multline}', tex_content, re.DOTALL)
+
+    return equations
+
 def has_balanced_brackets(command):
     return command.count('{') == command.count('}')
 
@@ -59,12 +66,6 @@ def extract_relevant_commands(preamble):
             if full_command.strip() != '\\':  # Ensure we aren't just adding a standalone backslash
                 relevant_content += full_command + '\n'
     
-    # Extracting new/renew environment definitions
-    environment_definitions_patterns = [
-        r'\\newenvironment',
-        r'\\renewenvironment'
-    ]
-
     for pattern in command_definitions_patterns:
         matches = [m.start() for m in re.finditer(pattern, preamble)]
         for match_start in matches:
@@ -79,10 +80,10 @@ def extract_relevant_commands(preamble):
     return relevant_content.strip()  # Using strip() to remove any leading or trailing newlines
 
 
-
 def create_equation_file(equation, output_dir, equation_index, relevant_content):
     equation_content = '\\documentclass[preview,varwidth]{standalone}\n'
-    equation_content += relevant_content + '\n'
+    if relevant_content:
+        equation_content += relevant_content + '\n'
 
     equation_content += '\\begin{document}\n'
 
@@ -162,21 +163,39 @@ if __name__ == "__main__":
     # Find all .tex files in the current folder if the input file is not provided
     if tex_file is None:
         tex_files = glob.glob('*.tex')
+
     else:
         tex_files = [tex_file]
 
     # Iterate over each .tex file
+    print(f"Processing input files: {tex_files}")
     for tex_file in tex_files:
         print(f"Processing input file: {tex_file}")
 
         equations = find_equations(tex_file)
 
         # Read the original tex file to find newcommand lines
-        with open(tex_file, 'r') as file:
-            tex_content = file.read()
-            newcommands = re.findall(r'\\newcommand.*?\n', tex_content, re.DOTALL)
-            preamble = re.search(r'\\documentclass.*?\\begin{document}', tex_content, re.DOTALL).group()
-            relevant_content = extract_relevant_commands(preamble)
+
+        if 0:
+            try:
+                with open(tex_file, 'r', encoding='utf-8', errors='replace') as file:
+                    tex_content = file.read()
+
+                # Extract the preamble (everything before \begin{document})
+                preamble_match = re.search(r'^(.*?)\\begin{document}', tex_content, re.DOTALL | re.MULTILINE)
+                if preamble_match:
+                    preamble = preamble_match.group(1)  # Get everything before \begin{document}
+                    relevant_content = extract_relevant_commands(preamble)
+                else:
+                    print(f"Preamble not found in {tex_file}")
+                    relevant_content = None
+            except Exception as e:
+                print(f"Error reading {tex_file}: {e}")
+                newcommands, relevant_content = [], None  # Default in case of error
+
+        # Add the required \usepackage command to the relevant_content
+        relevant_content = '\n\\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}'
+
 
         # Create the output directory
         if output_folder is None:
@@ -196,7 +215,13 @@ if __name__ == "__main__":
 
             # Set file permissions for the PDF file
             pdf_file = os.path.join(output_dir, f'{equation_basename}.pdf')
-            os.chmod(pdf_file, 0o755)  # Read, write, and execute permissions
+
+        try:
+            os.chmod(pdf_file, 0o755)  # Set read, write, and execute permissions
+        except FileNotFoundError as fnf_error:
+            print(f"File not found: {pdf_file}")
+        except Exception as e:
+            print(f"Error changing file permissions for {pdf_file}: {e}")
 
         try:
             subprocess.run(['inkscape', '--version'], check=True)
