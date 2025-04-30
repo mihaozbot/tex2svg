@@ -5,6 +5,9 @@ import subprocess
 import threading
 import sys
 
+import os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 def find_equations(tex_file):
     try:
         with open(tex_file, 'r', encoding='utf-8', errors='ignore') as file:  # Use 'ignore' to skip invalid characters
@@ -19,6 +22,7 @@ def find_equations(tex_file):
     equations += re.findall(r'\\begin{displaymath}(.*?)\\end{displaymath}', tex_content, re.DOTALL)
     equations += re.findall(r'\\begin{align}(.*?)\\end{align}', tex_content, re.DOTALL)
     equations += re.findall(r'\\begin{multline}(.*?)\\begin{multline}', tex_content, re.DOTALL)
+    equations += re.findall(r'\\begin{equation\*}(.*?)\\end{equation\*}', tex_content, re.DOTALL)
 
     return equations
 
@@ -137,8 +141,6 @@ def compile_equation(equation_file):
             
             process.kill()
 
-
-    
     return equation_basename
 
 def convert_pdf_to_svg(pdf_file, svg_file, inkscape_path):
