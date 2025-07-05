@@ -8,50 +8,82 @@ import sys
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 COMMENT_RE = re.compile(r'(^|[^\\])%.*$', re.MULTILINE)   # TeX comment lines
 
+MACRO_RE = re.compile(r'\\([A-Za-z@]+)')   # skip ctrl-symbols like \&, \%, …
+
+def macros_in_equation(body):
+    """Return a set of macro names (no backslash) found in the eq body."""
+    return {m.group(1) for m in MACRO_RE.finditer(body)}
+
+DEFINE_PATTERNS = [
+    r'\\newcommand\*?\s*{\s*\\%s\b',
+    r'\\renewcommand\*?\s*{\s*\\%s\b',
+    r'\\providecommand\*?\s*{\s*\\%s\b',
+    r'\\DeclareMathOperator\*?\s*{\s*\\%s\b',
+]
+
+def collect_definitions(needed, preamble):
+    """Return only the definition lines that define one of *needed*."""
+    lines = preamble.splitlines()
+    keeps = []
+    for line in lines:
+        for macro in needed:
+            for pat in DEFINE_PATTERNS:
+                if re.search(pat % re.escape(macro), line):
+                    keeps.append(line)
+                    break
+    return '\n'.join(keeps)
+
 
 # ─────────────────────────────────────────────
 #  FIND EQUATIONS (returns (env, body) tuples)
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  FIND EQUATIONS  (returns (env, body) tuples)
+# ─────────────────────────────────────────────
 def find_equations(tex_file):
     try:
-        with open(tex_file, 'r', encoding='utf-8', errors='ignore') as file:
-            tex_content = file.read()
+        with open(tex_file, "r", encoding="utf-8", errors="ignore") as f:
+            tex_content = f.read()
     except (UnicodeDecodeError, IOError) as e:
         print(f"Error reading {tex_file}: {e}")
         return []
 
     pattern = re.compile(
-        r'''
+        r"""
         \\begin\{(?P<env>equation\*?|align\*?|multline\*?|gather\*?|displaymath)\}
         (?P<body>[\s\S]*?)
         \\end\{\1\}
         |
         \\\[(?P<bracket_body>[\s\S]*?)\\]
-        ''',
-        re.VERBOSE
+        """,
+        re.VERBOSE,
     )
 
     equations = []
     for m in pattern.finditer(tex_content):
-        if m.group('env'):
-            env  = m.group('env')
-            body = m.group('body')
+        if m.group("env"):
+            env, body = m.group("env"), m.group("body")
         else:
-            env  = 'brackets'
-            body = m.group('bracket_body')
+            env, body = "brackets", m.group("bracket_body")
 
-        # strip comments
-        body_clean = re.sub(COMMENT_RE, '', body).strip()
+        # 1️⃣ strip TeX comments
+        body_clean = re.sub(COMMENT_RE, "", body).strip()
+
+        # 2️⃣ quick exit if nothing but comments
         if not body_clean:
             continue
 
-        # remove trailing punctuation
+        # 3️⃣ drop trailing punctuation
         body_clean = strip_trailing_punctuation(body_clean)
+
+        # 4️⃣ If the ONLY thing left is a \label{…}, treat as empty
+        if not re.sub(r"\\label\{[^\}]*\}", "", body_clean).strip():
+            continue
 
         equations.append((env, body_clean))
 
-    
     return equations
+
 
 def strip_trailing_punctuation(equation):
     return re.sub(r'[.,;:](\s*\\label\{[^\}]*\})?\s*$', '', equation.strip())
@@ -167,74 +199,69 @@ def convert_pdf_to_svg(pdf_file, svg_file, inkscape_path):
     except FileNotFoundError:
         print(f"Inkscape executable not found at path {inkscape_path}.")
 
-
-# ─────────────────────────────────────────────
-#  MAIN (enumerate start=1; rest unchanged)
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    tex_file = sys.argv[1] if len(sys.argv) > 1 else None
-    output_folder = sys.argv[2] if len(sys.argv) > 2 else None
+    import shutil, textwrap
 
-    tex_files = glob.glob('*.tex') if tex_file is None else [tex_file]
+    # ----------- CLI args -------------------------------------------------
+    tex_file_arg   = sys.argv[1] if len(sys.argv) > 1 else None
+    output_folder  = sys.argv[2] if len(sys.argv) > 2 else None
 
+    tex_files = glob.glob("*.tex") if tex_file_arg is None else [tex_file_arg]
     print(f"Processing input files: {tex_files}")
-    for tex_file in tex_files:
-        print(f"Processing input file: {tex_file}")
 
-        equations = find_equations(tex_file)
+    # ----------- loop over .tex files ------------------------------------
+    for tex_path in tex_files:
+        print(f"\n=== {tex_path} ===")
 
-        print(f"Found {len(equations)} equations:")
-        for n, (env, body) in enumerate(equations, start=1):
-            print(f"\n--- Eq {n} ({env}) ---\n{body}\n")
+        # read full source once
+        with open(tex_path, encoding="utf-8", errors="ignore") as f:
+            tex_source = f.read()
 
-        relevant_content = '\n\\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}'
+        # split preamble / body (first \begin{document})
+        m = re.search(r'\\begin{document}', tex_source)
+        preamble = tex_source[: m.start()] if m else ""
 
-        output_dir = os.path.splitext(tex_file)[0] if output_folder is None else output_folder
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        # ------ find all equations & which macros they use ----------------
+        equations = find_equations(tex_path)
+        print(f"Found {len(equations)} equation environment(s).")
 
-        print(f"Output directory: {output_dir}")
+        needed_macros = set().union(*(macros_in_equation(b) for _, b in equations))
+        print("User-defined macros referenced:", sorted(needed_macros))
 
-        # Save each equation (start=1 for numbering)
-        for i, eq in enumerate(equations, start=1):
-            equation_file = create_equation_file(eq, output_dir, i, relevant_content)
-            equation_basename = compile_equation(equation_file)
-            pdf_file = os.path.join(output_dir, f'{equation_basename}.pdf')
-
-        # permissions block unchanged
-        try:
-            os.chmod(pdf_file, 0o755)
-        except FileNotFoundError:
-            print(f"File not found: {pdf_file}")
-        except Exception as e:
-            print(f"Error changing permissions for {pdf_file}: {e}")
-
-        # Inkscape path detection (unchanged)
-        try:
-            subprocess.run(['inkscape', '--version'], check=True)
-            inkscape_path = 'inkscape'
-            print('Inkscape executable is available in the system PATH.')
-        except FileNotFoundError:
-            inkscape_path = r'C:\Program Files\Inkscape\bin\inkscape.exe'
-            print(f'The "inkscape" command is not in PATH. Using fallback {inkscape_path}.')
-
-        if os.path.exists(inkscape_path):
-            print('Inkscape executable found.')
+        relevant_content = collect_definitions(needed_macros, preamble)
+        if relevant_content:
+            print("Copied macro definitions:")
+            print(textwrap.indent(relevant_content, "    "))
         else:
-            print(f'Inkscape executable not found at the specified path {inkscape_path}.')
+            print("No user-defined macro definitions needed.")
 
-        try:
-            subprocess.run([inkscape_path, '--version'], check=True)
-            print("Inkscape executable is working.")
-        except subprocess.CalledProcessError as e:
-            print("Failed to run Inkscape. Error:", e)
-        except FileNotFoundError:
-            print("Inkscape executable not found. Please provide the correct path.")
+        # ------ choose / create output directory --------------------------
+        out_dir = (
+            os.path.splitext(tex_path)[0] if output_folder is None else output_folder
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Output directory: {out_dir}")
 
-        # Convert every PDF in the output dir
-        for file_name in os.listdir(output_dir):
-            if file_name.endswith('.pdf'):
-                pdf_file = os.path.join(output_dir, file_name)
-                svg_file = os.path.join(output_dir, file_name[:-4] + '.svg')
-                convert_pdf_to_svg(pdf_file, svg_file, inkscape_path)
-                print(f"Output SVG file: {svg_file}")
+        # ------ build every equation --------------------------------------
+        for idx, eq in enumerate(equations, start=1):
+            tex_file = create_equation_file(eq, out_dir, idx, relevant_content)
+            compile_equation(tex_file)
+
+        # ------ set sane perms on *nix (optional) -------------------------
+        if os.name != "nt":
+            for pdf in glob.glob(os.path.join(out_dir, "*.pdf")):
+                try:
+                    os.chmod(pdf, 0o644)
+                except Exception as e:
+                    print("chmod failed:", e)
+
+        # ------ PDF → SVG conversion (skip if Inkscape missing) ----------
+        inkscape_exe = shutil.which("inkscape") or r"C:\Program Files\Inkscape\bin\inkscape.exe"
+        if not shutil.which(inkscape_exe):
+            print("Inkscape not found; skipping PDF→SVG conversion.")
+            continue
+
+        for pdf in glob.glob(os.path.join(out_dir, "*.pdf")):
+            svg = pdf[:-4] + ".svg"
+            convert_pdf_to_svg(pdf, svg, inkscape_exe)
+            print("Created", svg)
