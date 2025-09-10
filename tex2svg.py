@@ -66,23 +66,48 @@ def find_equations(tex_file):
         else:
             env, body = "brackets", m.group("bracket_body")
 
-        # 1️⃣ strip TeX comments
+        # 1 strip TeX comments
         body_clean = re.sub(COMMENT_RE, "", body).strip()
 
-        # 2️⃣ quick exit if nothing but comments
+        # (recommended) also strip labels everywhere
+        body_clean = re.sub(r"\\label\{[^\}]*\}", "", body_clean)
+
+        # Normalize blank lines to avoid paragraph breaks inside math
+        body_clean = normalize_equation_body(body_clean)
+
+        #  quick exit if nothing but comments
         if not body_clean:
             continue
 
-        # 3️⃣ drop trailing punctuation
+        #  drop trailing punctuation
         body_clean = strip_trailing_punctuation(body_clean)
-
-        # 4️⃣ If the ONLY thing left is a \label{…}, treat as empty
+        
+        # If the ONLY thing left is a \label{…}, treat as empty
         if not re.sub(r"\\label\{[^\}]*\}", "", body_clean).strip():
             continue
 
         equations.append((env, body_clean))
 
     return equations
+
+def normalize_equation_body(s: str) -> str:
+    """Trim empty lines at the start/end and collapse internal blank runs."""
+    # strip leading/trailing blank lines
+    lines = s.splitlines()
+    while lines and lines[0].strip() == '':
+        lines.pop(0)
+    while lines and lines[-1].strip() == '':
+        lines.pop()
+    # collapse consecutive internal blank lines to a single blank
+    out = []
+    prev_blank = False
+    for ln in lines:
+        is_blank = (ln.strip() == '')
+        if is_blank and prev_blank:
+            continue
+        out.append(ln)
+        prev_blank = is_blank
+    return '\n'.join(out)
 
 
 def strip_trailing_punctuation(equation):
@@ -164,26 +189,47 @@ def compile_equation(equation_file):
         print(f'Skipping compilation for {equation_basename}.pdf. PDF file already exists.')
         return equation_basename
 
+    cmd = ['pdflatex', '-interaction=nonstopmode', '-halt-on-error',
+           '-output-directory', output_dir, equation_file]
+
     process = None
+    timed_out = False
 
-    def run_pdflatex():
-        nonlocal process
-        process = subprocess.Popen(['pdflatex', '-output-directory', output_dir, equation_file],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        _, _ = process.communicate()
+    def on_timeout():
+        nonlocal timed_out, process
+        timed_out = True
+        if process is not None and process.poll() is None:
+            process.kill()
 
-    timer = threading.Timer(10, lambda: process.kill() if process is not None else None)
+    timer = threading.Timer(60, on_timeout)  # was 10s; give MiKTeX time to load/install
     try:
         timer.start()
-        run_pdflatex()
-        print(f'Equation {equation_basename} compiled successfully.')
-    except:
-        print(f'Equation {equation_basename} failed!')
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = process.communicate()
     finally:
         timer.cancel()
-        if process is not None:
-            process.kill()
+
+    # Diagnose outcomes
+    if timed_out:
+        print(f'Equation {equation_basename} TIMED OUT (killed).')
+        return None
+
+    if process.returncode != 0:
+        print(f'Equation {equation_basename} FAILED with return code {process.returncode}.')
+        # surface log to help debugging
+        if out: print(out.decode(errors='ignore'))
+        if err: print(err.decode(errors='ignore'))
+        return None
+
+    if not os.path.exists(pdf_file):
+        print(f'Equation {equation_basename} FAILED: no PDF produced.')
+        if out: print(out.decode(errors='ignore'))
+        if err: print(err.decode(errors='ignore'))
+        return None
+
+    print(f'Equation {equation_basename} compiled successfully.')
     return equation_basename
+
 
 
 def convert_pdf_to_svg(pdf_file, svg_file, inkscape_path):
