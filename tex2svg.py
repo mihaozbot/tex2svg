@@ -4,11 +4,70 @@ import glob
 import subprocess
 import threading
 import sys
-
+import shutil
+import textwrap
+    
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 COMMENT_RE = re.compile(r'(^|[^\\])%.*$', re.MULTILINE)   # TeX comment lines
-
 MACRO_RE = re.compile(r'\\([A-Za-z@]+)')   # skip ctrl-symbols like \&, \%, …
+INCLUDE_RE = re.compile(r'\\(?:input|include)\{([^}]+)\}')
+
+def strip_comments(text: str) -> str:
+    """Remove TeX comments (unescaped %)."""
+    return re.sub(COMMENT_RE, r'\1', text)
+
+def resolve_include(parent_file: str, include_name: str) -> str:
+    """Resolve include path relative to the parent file; ensure .tex extension."""
+    name = include_name.strip()
+    if not name.endswith('.tex'):
+        name += '.tex'
+    if os.path.isabs(name):
+        return os.path.normpath(name)
+    base = os.path.dirname(os.path.abspath(parent_file))
+    return os.path.normpath(os.path.join(base, name))
+
+def expand_inputs(original_text: str, parent_file: str, visited=None) -> str:
+    """Recursively inline \input/\include contents."""
+    if visited is None:
+        visited = set()
+
+    def repl(m):
+        inc_name = m.group(1)
+        inc_path = resolve_include(parent_file, inc_name)
+        if inc_path in visited:
+            return ''  # break cycles
+        if not os.path.exists(inc_path):
+            print(f"[combine] Missing include: {inc_path}")
+            return m.group(0)  # keep original command
+        visited.add(inc_path)
+        try:
+            with open(inc_path, 'r', encoding='utf-8', errors='replace') as f:
+                sub = f.read()
+        except Exception as e:
+            print(f"[combine] Error reading {inc_path}: {e}")
+            return m.group(0)
+
+        # Recurse relative to the included file
+        return expand_inputs(sub, inc_path, visited)
+
+    # Do replacement on the original text so we preserve non-include content verbatim
+    return re.sub(INCLUDE_RE, repl, original_text)
+
+def find_included_files(tex_files):
+    """Return set of absolute paths that are included by any file in tex_files."""
+    included = set()
+    for tf in tex_files:
+        try:
+            with open(tf, 'r', encoding='utf-8', errors='replace') as f:
+                content_nc = strip_comments(f.read())
+            for inc in INCLUDE_RE.findall(content_nc):
+                included.add(resolve_include(tf, inc))
+        except Exception:
+            continue
+    return included
+
+def looks_full_document(tex_text: str) -> bool:
+    return (r'\documentclass' in tex_text) or (r'\begin{document}' in tex_text)
 
 def macros_in_equation(body):
     """Return a set of macro names (no backslash) found in the eq body."""
@@ -33,13 +92,10 @@ def collect_definitions(needed, preamble):
                     break
     return '\n'.join(keeps)
 
-
 # ─────────────────────────────────────────────
 #  FIND EQUATIONS (returns (env, body) tuples)
 # ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-#  FIND EQUATIONS  (returns (env, body) tuples)
-# ─────────────────────────────────────────────
+
 def find_equations(tex_file):
     try:
         with open(tex_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -160,18 +216,30 @@ def extract_relevant_commands(preamble):
 def create_equation_file(eq_tuple, output_dir, equation_index, relevant_content):
     env, body = eq_tuple
     eq_tex = '\\documentclass[preview,varwidth]{standalone}\n'
+    # Load packages BEFORE macros so \DeclareMathOperator exists
+    eq_tex += '\\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}\n'
     if relevant_content:
         eq_tex += relevant_content + '\n'
-    eq_tex += '\\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}\n'
     eq_tex += '\\begin{document}\n'
 
-    if env == 'brackets':                              #  \[ ... \]
+    if env == 'brackets':  # \[ ... \]
         eq_tex += '\\[\n' + body + '\n\\]\n'
     else:
-        star_env = env if env.endswith('*') else env + '*'
-        if not env.endswith('*'):                      # we just added the *
-            body = re.sub(r'\\label\{.*?\}', '', body) # ← strip labels
-        eq_tex += f'\\begin{{{star_env}}}\n{body}\n\\end{{{star_env}}}\n'
+        STAR_CAPABLE = {'equation', 'align', 'gather', 'multline'}  # NOT displaymath
+        base = env.rstrip('*')
+        if base in STAR_CAPABLE:
+            star_env = env if env.endswith('*') else env + '*'
+        else:
+            star_env = env  # keep displaymath unstarred
+
+        if not env.endswith('*'):
+            body = re.sub(r'\\label\{.*?\}', '', body)
+
+        # Optional: render displaymath using \[ ... \] instead of the environment
+        if base == 'displaymath':
+            eq_tex += '\\[\n' + body + '\n\\]\n'
+        else:
+            eq_tex += f'\\begin{{{star_env}}}\n{body}\n\\end{{{star_env}}}\n'
 
     eq_tex += '\\end{document}\n'
 
@@ -179,6 +247,7 @@ def create_equation_file(eq_tuple, output_dir, equation_index, relevant_content)
     with open(tex_path, 'w', encoding='utf-8') as f:
         f.write(eq_tex)
     return tex_path
+
 
 def compile_equation(equation_file):
     equation_basename = os.path.splitext(os.path.basename(equation_file))[0]
@@ -189,7 +258,10 @@ def compile_equation(equation_file):
         print(f'Skipping compilation for {equation_basename}.pdf. PDF file already exists.')
         return equation_basename
 
-    cmd = ['pdflatex', '-interaction=nonstopmode', '-halt-on-error',
+    # Detect TeX engine
+    tex_engine = shutil.which("pdflatex") or "pdflatex"
+
+    cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error',
            '-output-directory', output_dir, equation_file]
 
     process = None
@@ -201,7 +273,7 @@ def compile_equation(equation_file):
         if process is not None and process.poll() is None:
             process.kill()
 
-    timer = threading.Timer(60, on_timeout)  # was 10s; give MiKTeX time to load/install
+    timer = threading.Timer(60, on_timeout)
     try:
         timer.start()
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -209,14 +281,12 @@ def compile_equation(equation_file):
     finally:
         timer.cancel()
 
-    # Diagnose outcomes
     if timed_out:
         print(f'Equation {equation_basename} TIMED OUT (killed).')
         return None
 
     if process.returncode != 0:
         print(f'Equation {equation_basename} FAILED with return code {process.returncode}.')
-        # surface log to help debugging
         if out: print(out.decode(errors='ignore'))
         if err: print(err.decode(errors='ignore'))
         return None
@@ -230,7 +300,38 @@ def compile_equation(equation_file):
     print(f'Equation {equation_basename} compiled successfully.')
     return equation_basename
 
+def find_inkscape():
+    # 1) explicit env var wins
+    if os.getenv("INKSCAPE"):
+        path = os.getenv("INKSCAPE")
+        print(f"Inkscape path from $INKSCAPE: {path}")
+        return path
 
+    # 2) PATH
+    p = shutil.which("inkscape")
+    if p:
+        print(f"Inkscape found in PATH: {p}")
+        return p
+
+    # 3) OS-specific fallbacks
+    fallbacks = []
+    if sys.platform.startswith("win"):
+        fallbacks = [
+            r"C:\Program Files\Inkscape\bin\inkscape.exe",
+            r"C:\Program Files\Inkscape\inkscape.exe",
+        ]
+    elif sys.platform == "darwin":
+        fallbacks = ["/Applications/Inkscape.app/Contents/MacOS/inkscape"]
+    else:  # linux/bsd
+        fallbacks = ["/usr/bin/inkscape", "/usr/local/bin/inkscape"]
+
+    for f in fallbacks:
+        if os.path.exists(f):
+            print(f"Inkscape found in fallback location: {f}")
+            return f
+
+    print("Inkscape not found in PATH, $INKSCAPE, or fallback locations.")
+    return None
 
 def convert_pdf_to_svg(pdf_file, svg_file, inkscape_path):
     if os.path.exists(svg_file):
@@ -246,32 +347,90 @@ def convert_pdf_to_svg(pdf_file, svg_file, inkscape_path):
         print(f"Inkscape executable not found at path {inkscape_path}.")
 
 if __name__ == "__main__":
-    import shutil, textwrap
-
     # ----------- CLI args -------------------------------------------------
     tex_file_arg   = sys.argv[1] if len(sys.argv) > 1 else None
     output_folder  = sys.argv[2] if len(sys.argv) > 2 else None
 
+    # Search set
     tex_files = glob.glob("*.tex") if tex_file_arg is None else [tex_file_arg]
     print(f"Processing input files: {tex_files}")
+    if not tex_files:
+        print("No .tex files found.")
+        sys.exit(1)
 
-    # ----------- loop over .tex files ------------------------------------
+    # Determine which files are included by others → we will skip those
+    tex_files_abs = [os.path.abspath(p) for p in tex_files]
+    included_by_others = find_included_files(tex_files_abs)
+
+    # Detect TeX engine ONCE
+    tex_engine = shutil.which("pdflatex") or "pdflatex"
+    if tex_engine:
+        print(f"Using TeX engine: {tex_engine}")
+    else:
+        print("Warning: No TeX engine (pdflatex) found in PATH.")
+
+    # ----------- loop over root .tex files only ---------------------------
     for tex_path in tex_files:
+        abs_tex_path = os.path.abspath(tex_path)
+        if abs_tex_path in included_by_others:
+            print(f"\n=== {tex_path} (skipping: included by another file) ===")
+            continue
+
         print(f"\n=== {tex_path} ===")
 
-        # read full source once
-        with open(tex_path, encoding="utf-8", errors="ignore") as f:
-            tex_source = f.read()
+        # choose / create output directory (one per root file)
+        out_dir = (os.path.splitext(tex_path)[0] if output_folder is None else output_folder)
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Output directory: {out_dir}")
 
-        # split preamble / body (first \begin{document})
+        # read source
+        try:
+            with open(tex_path, encoding="utf-8", errors="ignore") as f:
+                original_src = f.read()
+        except Exception as e:
+            print(f"Error reading {tex_path}: {e}")
+            continue
+
+        # check if merging is required (any \input/\include present)
+        has_includes = bool(INCLUDE_RE.search(strip_comments(original_src)))
+
+        # expand includes (always produce a working text; optionally write tmp if merged)
+        combined_src = expand_inputs(original_src, tex_path)
+
+        # decide if this is a "full" document (preamble/content marker present)
+        is_full = looks_full_document(combined_src)
+        print(f"Has includes: {has_includes} | Looks full: {is_full}")
+
+        # if merging required, write a tmp combined file into output folder
+        work_tex_path = tex_path
+        if has_includes:
+            base = os.path.splitext(os.path.basename(tex_path))[0]
+            work_tex_path = os.path.abspath(os.path.join(out_dir, f"combined_{base}.tex"))
+            with open(work_tex_path, 'w', encoding='utf-8') as out_f:
+                out_f.write(combined_src)
+            print(f"[combine] Wrote: {work_tex_path}")
+
+        # If not a full doc, skip extracting/compiling (per your requirement)
+        if not is_full:
+            print("[combine] Skipping (not a full document: no \\documentclass or \\begin{document}).")
+            continue
+
+        # Split preamble/body from the *working* tex
+        try:
+            with open(work_tex_path, encoding="utf-8", errors="ignore") as f:
+                tex_source = f.read()
+        except Exception as e:
+            print(f"Error reading working file {work_tex_path}: {e}")
+            continue
+
         m = re.search(r'\\begin{document}', tex_source)
         preamble = tex_source[: m.start()] if m else ""
 
         # ------ find all equations & which macros they use ----------------
-        equations = find_equations(tex_path)
+        equations = find_equations(work_tex_path)
         print(f"Found {len(equations)} equation environment(s).")
 
-        needed_macros = set().union(*(macros_in_equation(b) for _, b in equations))
+        needed_macros = set().union(*(macros_in_equation(b) for _, b in equations)) if equations else set()
         print("User-defined macros referenced:", sorted(needed_macros))
 
         relevant_content = collect_definitions(needed_macros, preamble)
@@ -280,13 +439,6 @@ if __name__ == "__main__":
             print(textwrap.indent(relevant_content, "    "))
         else:
             print("No user-defined macro definitions needed.")
-
-        # ------ choose / create output directory --------------------------
-        out_dir = (
-            os.path.splitext(tex_path)[0] if output_folder is None else output_folder
-        )
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"Output directory: {out_dir}")
 
         # ------ build every equation --------------------------------------
         for idx, eq in enumerate(equations, start=1):
@@ -302,12 +454,10 @@ if __name__ == "__main__":
                     print("chmod failed:", e)
 
         # ------ PDF → SVG conversion (skip if Inkscape missing) ----------
-        inkscape_exe = shutil.which("inkscape") or r"C:\Program Files\Inkscape\bin\inkscape.exe"
-        if not shutil.which(inkscape_exe):
-            print("Inkscape not found; skipping PDF→SVG conversion.")
-            continue
-
-        for pdf in glob.glob(os.path.join(out_dir, "*.pdf")):
-            svg = pdf[:-4] + ".svg"
-            convert_pdf_to_svg(pdf, svg, inkscape_exe)
-            print("Created", svg)
+        inkscape_exe = find_inkscape()
+        if not inkscape_exe:
+            print("Inkscape not found; set $INKSCAPE or add to PATH. Skipping PDF→SVG.")
+        else:
+            for pdf in glob.glob(os.path.join(out_dir, "*.pdf")):
+                svg = pdf[:-4] + ".svg"
+                convert_pdf_to_svg(pdf, svg, inkscape_exe)
