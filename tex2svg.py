@@ -6,11 +6,165 @@ import threading
 import sys
 import shutil
 import textwrap
-    
+import tempfile
+from typing import List, Dict, Optional, Tuple
+
+
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 COMMENT_RE = re.compile(r'(^|[^\\])%.*$', re.MULTILINE)   # TeX comment lines
 MACRO_RE = re.compile(r'\\([A-Za-z@]+)')   # skip ctrl-symbols like \&, \%, …
 INCLUDE_RE = re.compile(r'\\(?:input|include)\{([^}]+)\}')
+VERBATIM_ENVS = ("verbatim", "lstlisting", "minted", "Verbatim")
+TIMER_TIMEOUT = 20
+AUTO_LABEL_PREFIX = "__ext_eq"
+
+
+
+def _clean_tag_for_filename(raw: Optional[str]) -> str:
+    if not raw:
+        return "unnumbered"
+    t = raw.strip()
+    if t.startswith('(') and t.endswith(')'):
+        t = t[1:-1].strip()
+    t = re.sub(r'\s+', '_', t)
+    t = re.sub(r'[^\w\.\-]', '_', t)
+    if not t:
+        return "unnumbered"
+    return t
+
+def make_filename_with_tag(idx: int, display_name: Optional[str], width: int = 3) -> str:
+    num = f"{idx:0{width}d}"
+    tag = _clean_tag_for_filename(display_name)
+    filename = f"{num}_({tag}).tex"
+    return filename
+
+# ----------------------- label-injection & aux parsing -----------------------
+def should_label_for_numbering(env_name: str) -> bool:
+    """Match the environments you want LaTeX to number."""
+    if env_name.endswith('*'):
+        return False
+    base = env_name.rstrip('*')
+    return base in ('equation', 'align', 'gather', 'multline', 'displaymath')
+
+def inject_labels_into_temp_source(combined_src: str, eqs: List[Tuple[str,str]]) -> Tuple[str, List[Optional[str]]]:
+    """
+    eqs: list of (env, body_clean) tuples (as returned by your find_equations).
+    We search for the body text in combined_src and insert \label{__ext_eqN} just before
+    the environment end (best-effort). Returns modified source and list of inserted label names.
+    """
+    out = combined_src
+    auto_labels = [None] * len(eqs)
+
+    # To avoid matching the same place repeatedly, keep a search cursor
+    cursor = 0
+    for i in range(len(eqs)):
+        env, body = eqs[i]
+        if not should_label_for_numbering(env):
+            continue
+
+        # find the body occurrence in the combined source starting from cursor
+        idx = out.find(body, cursor)
+        if idx == -1:
+            # fallback: try from beginning (body might be earlier)
+            idx = out.find(body)
+            if idx == -1:
+                continue
+
+        # try to find the corresponding end token after idx
+        search_end_region = out[idx: idx + len(body) + 1000]  # small window for following \end{...}
+        lbl = f"{AUTO_LABEL_PREFIX}{i+1}"
+        insertion = f"\\label{{{lbl}}}"
+
+        if env == 'brackets':
+            # place label before the closing \]
+            m = re.search(r'\\\]\s*', out[idx: idx + len(body) + 2000])
+            if m:
+                insert_pos = idx + m.start()
+                out = out[:insert_pos] + insertion + out[insert_pos:]
+                auto_labels[i] = lbl
+                cursor = insert_pos + len(insertion)
+                continue
+        else:
+            base = env.rstrip('*')
+            # look for \end{<base>} after the body
+            m_end = re.search(r'\\end\{\s*' + re.escape(base) + r'\s*\}', out[idx: idx + len(body) + 2000])
+            if m_end:
+                insert_pos = idx + m_end.start()
+                out = out[:insert_pos] + insertion + out[insert_pos:]
+                auto_labels[i] = lbl
+                cursor = insert_pos + len(insertion)
+                continue
+
+        # fallback: append the label immediately after the body match
+        insert_pos = idx + len(body)
+        out = out[:insert_pos] + insertion + out[insert_pos:]
+        auto_labels[i] = lbl
+        cursor = insert_pos + len(insertion)
+
+    return out, auto_labels
+
+def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30) -> Optional[Dict[str,str]]:
+    """Write temp .tex into a temporary directory, run pdflatex once, parse .aux and return label->printed mapping."""
+    tex_engine = shutil.which("pdflatex") or "pdflatex"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tex_path = os.path.join(tmpdir, "temp_for_labels.tex")
+        with open(tex_path, "w", encoding="utf-8") as f:
+            f.write(temp_src)
+        cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpdir, tex_path]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            return None
+        aux_path = os.path.join(tmpdir, "temp_for_labels.aux")
+        if not os.path.exists(aux_path):
+            # compilation failed
+            return None
+        # parse \newlabel{label}{{printed}{page}...}
+        mapping = {}
+        newlabel_re = re.compile(r'\\newlabel\{(?P<label>[^\}]+)\}\{\{(?P<printed>[^}]*)\}')
+        with open(aux_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = newlabel_re.search(line)
+                if m:
+                    mapping[m.group("label")] = m.group("printed")
+        return mapping
+
+def map_equations_to_display_names(combined_src: str, eqs: List[Tuple[str,str]]) -> List[Optional[str]]:
+    """
+    Main helper: returns display name (printed) or None for each equation in eqs.
+    eqs is the list produced by your (existing) find_equations(...) -> (env, body) tuples.
+    """
+    temp_src, auto_labels = inject_labels_into_temp_source(combined_src, eqs)
+    label_map = compile_temp_and_parse_aux(temp_src)
+    if label_map is None:
+        # compilation failed; return None for all
+        return [None] * len(eqs)
+
+    results = []
+    for i, (env, body) in enumerate(eqs):
+        # check original snippet for an existing \label (use body location as heuristic)
+        # find snippet in original combined_src
+        pos = combined_src.find(body)
+        snippet = combined_src[pos: pos + len(body)] if pos != -1 else ""
+        m_label = re.search(r'\\label\{([^}]+)\}', snippet)
+        if m_label:
+            lab = m_label.group(1)
+            printed = label_map.get(lab)
+            if printed:
+                results.append(printed)
+                continue
+        # check auto label
+        auto = auto_labels[i]
+        if auto and auto in label_map:
+            results.append(label_map[auto])
+            continue
+        # explicit tag in body?
+        m_tag = re.search(r'\\tag\{([^}]*)\}', body)
+        if m_tag:
+            results.append(m_tag.group(1))
+            continue
+        results.append(None)
+    return results
 
 def strip_comments(text: str) -> str:
     """Remove TeX comments (unescaped %)."""
@@ -92,6 +246,71 @@ def collect_definitions(needed, preamble):
                     break
     return '\n'.join(keeps)
 
+def _strip_comments_by_line(text: str) -> str:
+    """Remove unescaped % and the rest of the line.
+    - Treat % as escaped when preceded by an odd number of backslashes.
+    - If the line is only a comment (or whitespace + comment), remove the whole line
+      (no blank line left).
+    - If there's code before %, keep that code and preserve the newline.
+    """
+    out_lines = []
+    for line in text.splitlines(keepends=True):
+        i = 0
+        removed = False
+        while True:
+            p = line.find('%', i)
+            if p == -1:
+                break
+            # count consecutive backslashes immediately before p
+            j = p - 1
+            bs = 0
+            while j >= 0 and line[j] == '\\':
+                bs += 1
+                j -= 1
+            if bs % 2 == 0:
+                # unescaped % -> decide whether line is comment-only
+                prefix = line[:p]
+                # if prefix contains only whitespace, drop the whole line
+                if prefix.strip() == '':
+                    # drop the entire line (no newline), i.e. remove the blank line
+                    line = ''
+                else:
+                    # keep code before %, strip trailing whitespace, preserve newline
+                    newline = '\n' if line.endswith('\n') else ''
+                    line = prefix.rstrip() + newline
+                removed = True
+                break
+            else:
+                # escaped %, continue search after this %
+                i = p + 1
+        # If there was no % at all and the line is just whitespace and you want to
+        # remove blank lines globally, you can optionally strip it here.
+        out_lines.append(line)
+    return ''.join(out_lines)
+
+
+def strip_comments_preserve_verbatim(text: str) -> str:
+    """Remove comments outside of verbatim-like environments, preserving verbatim blocks."""
+    # build a pattern to find verbatim blocks
+    envs = "|".join(re.escape(e) for e in VERBATIM_ENVS)
+    if envs:
+        verbpat = re.compile(r'(?s)\\begin\{(' + envs + r')\}.*?\\end\{\1\}')
+    else:
+        verbpat = None
+
+    out = []
+    pos = 0
+    if verbpat:
+        for m in verbpat.finditer(text):
+            # strip comments from the chunk before this verbatim block
+            out.append(_strip_comments_by_line(text[pos:m.start()]))
+            # append verbatim block unchanged
+            out.append(m.group(0))
+            pos = m.end()
+    out.append(_strip_comments_by_line(text[pos:]))
+    return ''.join(out)
+
+
 # ─────────────────────────────────────────────
 #  FIND EQUATIONS (returns (env, body) tuples)
 # ─────────────────────────────────────────────
@@ -103,6 +322,8 @@ def find_equations(tex_file):
     except (UnicodeDecodeError, IOError) as e:
         print(f"Error reading {tex_file}: {e}")
         return []
+
+    tex_content_clean = strip_comments_preserve_verbatim(tex_content)
 
     pattern = re.compile(
         r"""
@@ -116,7 +337,7 @@ def find_equations(tex_file):
     )
 
     equations = []
-    for m in pattern.finditer(tex_content):
+    for m in pattern.finditer(tex_content_clean):
         if m.group("env"):
             env, body = m.group("env"), m.group("body")
         else:
@@ -273,7 +494,7 @@ def compile_equation(equation_file):
         if process is not None and process.poll() is None:
             process.kill()
 
-    timer = threading.Timer(60, on_timeout)
+    timer = threading.Timer(TIMER_TIMEOUT, on_timeout)
     try:
         timer.start()
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
