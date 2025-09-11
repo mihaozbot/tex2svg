@@ -15,10 +15,14 @@ COMMENT_RE = re.compile(r'(^|[^\\])%.*$', re.MULTILINE)   # TeX comment lines
 MACRO_RE = re.compile(r'\\([A-Za-z@]+)')   # skip ctrl-symbols like \&, \%, …
 INCLUDE_RE = re.compile(r'\\(?:input|include)\{([^}]+)\}')
 VERBATIM_ENVS = ("verbatim", "lstlisting", "minted", "Verbatim")
-TIMER_TIMEOUT = 20
+TIMER_TIMEOUT = 60
 AUTO_LABEL_PREFIX = "__ext_eq"
+DEBUG_MODE = True
 
-
+def extract_chapters(clean_text: str):
+    """Return list of (pos, title) of \\chapter{...} or \\chapter*{...} in cleaned text."""
+    chap_re = re.compile(r'\\chapter\*?\s*\{([^}]*)\}')
+    return [(m.start(), m.group(1)) for m in chap_re.finditer(clean_text)]
 
 def _clean_tag_for_filename(raw: Optional[str]) -> str:
     if not raw:
@@ -36,7 +40,6 @@ def make_filename_with_tag(idx: int, display_name: Optional[str], width: int = 3
     num = f"{idx:0{width}d}"
     tag = _clean_tag_for_filename(display_name)
     return f"{prefix}_{num}_({tag}).tex"
-
 
 # ----------------------- label-injection & aux parsing -----------------------
 def should_label_for_numbering(env_name: str) -> bool:
@@ -105,23 +108,66 @@ def inject_labels_into_temp_source(clean_text: str, eqs: List[Dict]) -> Tuple[st
 
     return out, auto_labels
 
-def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30) -> Optional[Dict[str,str]]:
+def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30, debug_dir: Optional[str] = None) -> Optional[Dict[str,str]]:
+    """
+    Compile temp_src with pdflatex and parse the .aux for \\newlabel mappings.
+    If debug_dir is provided, write temp_for_labels.tex/.pdf/.aux/.log there and keep them.
+    """
     tex_engine = shutil.which("pdflatex") or "pdflatex"
-    with tempfile.TemporaryDirectory() as tmpdir:
+
+    # Choose where to write files
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        tmpdir_cm = None
+        tmpdir = debug_dir
+    else:
+        tmpdir_cm = tempfile.TemporaryDirectory()
+        tmpdir = tmpdir_cm.__enter__()
+
+    try:
         tex_name = "temp_for_labels.tex"
         tex_path = os.path.join(tmpdir, tex_name)
         with open(tex_path, "w", encoding="utf-8") as f:
             f.write(temp_src)
-        # Run inside tmpdir and compile the basename
-        cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error', tex_name]
+
+        cmd = [
+            tex_engine,
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-file-line-error",
+            tex_name,
+        ]
         try:
-            proc = subprocess.run(cmd, cwd=tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  timeout=timeout, check=False)
+            proc = subprocess.run(
+                cmd, cwd=tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout, check=False
+            )
         except subprocess.TimeoutExpired:
+            if debug_dir:
+                with open(os.path.join(tmpdir, "compile_timeout.log"), "wb") as lf:
+                    lf.write(b"pdflatex timeout\n")
             return None
+
+        # Always save output logs if debugging
+        if debug_dir:
+            with open(os.path.join(tmpdir, "compile_stdout.log"), "wb") as lf:
+                lf.write(proc.stdout or b"")
+            with open(os.path.join(tmpdir, "compile_stderr.log"), "wb") as lf:
+                lf.write(proc.stderr or b"")
+
         aux_path = os.path.join(tmpdir, "temp_for_labels.aux")
+        pdf_path = os.path.join(tmpdir, "temp_for_labels.pdf")
+        log_path = os.path.join(tmpdir, "temp_for_labels.log")
+
         if not os.path.exists(aux_path):
+            # If AUX is missing, keep artifacts when debug_dir is set; print a hint.
+            if debug_dir:
+                print(f"[debug] temp compile produced no AUX. See: {tmpdir}")
+                if os.path.exists(log_path):
+                    print(f"[debug] LaTeX log: {log_path}")
             return None
+
+        # Parse label mappings: \newlabel{label}{{printed}{page}...}
         mapping = {}
         newlabel_re = re.compile(r'\\newlabel\{(?P<label>[^\}]+)\}\{\{(?P<printed>[^}]*)\}')
         with open(aux_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -129,10 +175,18 @@ def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30) -> Optional[Dic
                 m = newlabel_re.search(line)
                 if m:
                     mapping[m.group("label")] = m.group("printed")
-        return mapping
 
-def _drop_unresolved_inputs(src: str) -> str:
-    return re.sub(r'\\(?:input|include)\{[^}]+\}', '% dropped missing input\n', src)
+        # Helpful print
+        if debug_dir:
+            print(f"[debug] numbering AUX parsed. Labels found: {len(mapping)} | Debug dir: {tmpdir}")
+            if os.path.exists(pdf_path):
+                print(f"[debug] temp_for_labels.pdf saved for inspection.")
+
+        return mapping
+    finally:
+        if tmpdir_cm:
+            tmpdir_cm.__exit__(None, None, None)
+
 
 def _sanitize_for_temp_compile(s: str) -> str:
     # Drop unresolved inputs/includes (avoid missing files in tmp)
@@ -163,31 +217,38 @@ def _sanitize_for_temp_compile(s: str) -> str:
         s = s.rstrip() + '\n\\end{document}\n'
     return s
 
-def map_equations_to_display_names(clean_src: str, eq_dicts: List[Dict]) -> List[Optional[str]]:
+def map_equations_to_display_names(clean_src: str, eq_dicts: List[Dict], debug_dir: Optional[str] = None) -> List[Optional[str]]:
     temp_src, auto_labels = inject_labels_into_temp_source(clean_src, eq_dicts)
-    temp_src = _sanitize_for_temp_compile(temp_src)  # <— important
-    label_map = compile_temp_and_parse_aux(temp_src)
+    temp_src = _sanitize_for_temp_compile(temp_src)
+    label_map = compile_temp_and_parse_aux(temp_src, debug_dir=debug_dir)
+
     if label_map is None:
+        print("[debug] label_map is None → all names will be 'unnumbered'.")
         return [None] * len(eq_dicts)
 
     results = []
     for i, e in enumerate(eq_dicts):
+        reason = None
         if e["has_tag"]:
             results.append(e["tag_text"])
-            continue
-
-        # Only trust \label if the env can number (equation/align/gather/multline)
-        if should_label_for_numbering(e["env"]) and e["has_label"] and e["label_name"] in label_map:
+            reason = f"eq#{i+1}: used explicit \\tag{{...}} → '{e['tag_text']}'"
+        elif should_label_for_numbering(e["env"]) and e["has_label"] and e["label_name"] in label_map:
             results.append(label_map[e["label_name"]])
-            continue
+            reason = f"eq#{i+1}: used existing \\label{{{e['label_name']}}} → '{label_map[e['label_name']]}'"
+        else:
+            auto = auto_labels[i]
+            if auto and auto in label_map:
+                results.append(label_map[auto])
+                reason = f"eq#{i+1}: used auto label {auto} → '{label_map[auto]}'"
+            else:
+                results.append(None)
+                reason = f"eq#{i+1}: no tag/label and not numberable or missing in AUX → unnumbered"
 
-        auto = auto_labels[i]
-        if auto and auto in label_map:
-            results.append(label_map[auto])
-            continue
+        if debug_dir:
+            print("[debug]", reason)
 
-        results.append(None)
     return results
+
 
 def strip_comments(text: str) -> str:
     """Remove TeX comments (unescaped %)."""
@@ -657,6 +718,10 @@ if __name__ == "__main__":
         os.makedirs(out_dir, exist_ok=True)
         print(f"Output directory: {out_dir}")
 
+        debug_dir = os.path.join(out_dir, "_numbering_debug") if DEBUG_MODE else None
+        if DEBUG_MODE:
+            print(f"[debug] Debug mode ON. Artifacts will be saved in: {debug_dir}")
+    
         # read source
         try:
             with open(tex_path, encoding="utf-8", errors="ignore") as f:
@@ -698,13 +763,28 @@ if __name__ == "__main__":
             continue
 
         tex_source_clean = strip_comments_preserve_verbatim(tex_source)
-        equation_dicts = find_equations(tex_source_clean)  # dicts with start/end
+
+        # Chapter detection debug (from cleaned text)
+        chapters = extract_chapters(tex_source_clean)
+        if chapters:
+            print(f"[debug] Chapters found: {len(chapters)} → {[t for _, t in chapters]}")
+        else:
+            print("[debug] No \\chapter{...} found in cleaned source.")
+
+        equation_dicts = find_equations(tex_source_clean)
+
+        # Quick per-eq debug line
+        for i, e in enumerate(equation_dicts, 1):
+            print(f"[debug] eq#{i}: env={e['env']}, starred={e['is_starred']}, "
+                f"has_tag={e['has_tag']}, has_label={e['has_label']}, "
+                f"chapter_index={e['chapter_index']}")
+
 
         # macros:
         needed_macros = set().union(*(macros_in_equation(e["clean_body"]) for e in equation_dicts)) if equation_dicts else set()
 
         # printed names:
-        display_names = map_equations_to_display_names(tex_source_clean, equation_dicts)
+        display_names = map_equations_to_display_names(tex_source_clean, equation_dicts, debug_dir=debug_dir)
 
         # Optional: drop "0." for pre-chapter equations
         def _normalize_printed_name_for_prechapter(printed: Optional[str], e: Dict) -> Optional[str]:
@@ -728,6 +808,21 @@ if __name__ == "__main__":
             create_equation_file((e["env"], e["clean_body"]), out_path, relevant_content)  # numberless output
             compile_equation(out_path)
             
+        if DEBUG_MODE:
+            try:
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, "summary.txt"), "w", encoding="utf-8") as sf:
+                    sf.write(f"Chapters ({len(chapters)}): {[t for _, t in chapters]}\n")
+                    for i, (e, nm) in enumerate(zip(equation_dicts, display_names), 1):
+                        sf.write(f"eq#{i}: env={e['env']}, ch={e['chapter_index']}, "
+                                f"tag={e['tag_text'] if e['has_tag'] else '-'}, "
+                                f"label={e['label_name'] if e['has_label'] else '-'}, "
+                                f"printed={nm}\n")
+                print(f"[debug] Wrote {os.path.join(debug_dir, 'summary.txt')}")
+            except Exception as ex:
+                print("[debug] Failed to write summary:", ex)
+
+    
         # ------ PDF → SVG conversion (skip if Inkscape missing) ----------
         inkscape_exe = find_inkscape()
         if not inkscape_exe:
