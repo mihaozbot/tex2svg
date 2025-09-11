@@ -32,11 +32,11 @@ def _clean_tag_for_filename(raw: Optional[str]) -> str:
         return "unnumbered"
     return t
 
-def make_filename_with_tag(idx: int, display_name: Optional[str], width: int = 3) -> str:
+def make_filename_with_tag(idx: int, display_name: Optional[str], width: int = 3, prefix: str = "Eq") -> str:
     num = f"{idx:0{width}d}"
     tag = _clean_tag_for_filename(display_name)
-    filename = f"{num}_({tag}).tex"
-    return filename
+    return f"{prefix}_{num}_({tag}).tex"
+
 
 # ----------------------- label-injection & aux parsing -----------------------
 def should_label_for_numbering(env_name: str) -> bool:
@@ -105,24 +105,23 @@ def inject_labels_into_temp_source(clean_text: str, eqs: List[Dict]) -> Tuple[st
 
     return out, auto_labels
 
-
 def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30) -> Optional[Dict[str,str]]:
-    """Write temp .tex into a temporary directory, run pdflatex once, parse .aux and return label->printed mapping."""
     tex_engine = shutil.which("pdflatex") or "pdflatex"
     with tempfile.TemporaryDirectory() as tmpdir:
-        tex_path = os.path.join(tmpdir, "temp_for_labels.tex")
+        tex_name = "temp_for_labels.tex"
+        tex_path = os.path.join(tmpdir, tex_name)
         with open(tex_path, "w", encoding="utf-8") as f:
             f.write(temp_src)
-        cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpdir, tex_path]
+        # Run inside tmpdir and compile the basename
+        cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error', tex_name]
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+            proc = subprocess.run(cmd, cwd=tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return None
         aux_path = os.path.join(tmpdir, "temp_for_labels.aux")
         if not os.path.exists(aux_path):
-            # compilation failed
             return None
-        # parse \newlabel{label}{{printed}{page}...}
         mapping = {}
         newlabel_re = re.compile(r'\\newlabel\{(?P<label>[^\}]+)\}\{\{(?P<printed>[^}]*)\}')
         with open(aux_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -525,7 +524,6 @@ def create_equation_file(eq_tuple, output_path, relevant_content):
         f.write(''.join(parts))
     return output_path
 
-
 def compile_equation(equation_file):
     equation_basename = os.path.splitext(os.path.basename(equation_file))[0]
     output_dir = os.path.dirname(equation_file)
@@ -535,11 +533,9 @@ def compile_equation(equation_file):
         print(f'Skipping compilation for {equation_basename}.pdf. PDF file already exists.')
         return equation_basename
 
-    # Detect TeX engine
     tex_engine = shutil.which("pdflatex") or "pdflatex"
-
-    cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error',
-           '-output-directory', output_dir, equation_file]
+    # Run in the output dir and pass only the basename → no backslashes in TeX argument
+    cmd = [tex_engine, '-interaction=nonstopmode', '-halt-on-error', f'{equation_basename}.tex']
 
     process = None
     timed_out = False
@@ -553,7 +549,7 @@ def compile_equation(equation_file):
     timer = threading.Timer(TIMER_TIMEOUT, on_timeout)
     try:
         timer.start()
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=output_dir)
         out, err = process.communicate()
     finally:
         timer.cancel()
@@ -576,6 +572,7 @@ def compile_equation(equation_file):
 
     print(f'Equation {equation_basename} compiled successfully.')
     return equation_basename
+
 
 def find_inkscape():
     # 1) explicit env var wins
