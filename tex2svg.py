@@ -40,68 +40,71 @@ def make_filename_with_tag(idx: int, display_name: Optional[str], width: int = 3
 
 # ----------------------- label-injection & aux parsing -----------------------
 def should_label_for_numbering(env_name: str) -> bool:
-    """Match the environments you want LaTeX to number."""
     if env_name.endswith('*'):
         return False
     base = env_name.rstrip('*')
-    return base in ('equation', 'align', 'gather', 'multline', 'displaymath')
+    return base in ('equation', 'align', 'gather', 'multline')
 
-def inject_labels_into_temp_source(combined_src: str, eqs: List[Tuple[str,str]]) -> Tuple[str, List[Optional[str]]]:
+def _normalize_printed_name_for_prechapter(printed: Optional[str], eq_meta: Dict) -> Optional[str]:
+    if not printed:
+        return None
+    # If equation appears before the first \chapter, drop a leading "0."
+    if eq_meta.get("chapter_index") is None:
+        m = re.match(r'^0\.(.+)$', printed)
+        if m:
+            return m.group(1)
+    return printed
+
+def inject_labels_into_temp_source(clean_text: str, eqs: List[Dict]) -> Tuple[str, List[Optional[str]]]:
     """
-    eqs: list of (env, body_clean) tuples (as returned by your find_equations).
-    We search for the body text in combined_src and insert \label{__ext_eqN} just before
-    the environment end (best-effort). Returns modified source and list of inserted label names.
+    Insert \label{__ext_eqN} for equations that can number and don't already
+    have \label or \tag. Works left-to-right using substring search so it’s
+    robust to earlier edits.
     """
-    out = combined_src
+    out = clean_text
     auto_labels = [None] * len(eqs)
-
-    # To avoid matching the same place repeatedly, keep a search cursor
     cursor = 0
-    for i in range(len(eqs)):
-        env, body = eqs[i]
-        if not should_label_for_numbering(env):
+
+    for i, e in enumerate(eqs):
+        env = e["env"]
+        if e.get("is_starred") or not should_label_for_numbering(env):
+            continue
+        if e.get("has_label") or e.get("has_tag"):
+            # Respect explicit \label or \tag
             continue
 
-        # find the body occurrence in the combined source starting from cursor
-        idx = out.find(body, cursor)
-        if idx == -1:
-            # fallback: try from beginning (body might be earlier)
-            idx = out.find(body)
-            if idx == -1:
+        body = e["clean_body"]
+        j = out.find(body, cursor)
+        if j == -1:
+            # fallback: try from the beginning (handles duplicates OK-ish)
+            j = out.find(body)
+            if j == -1:
                 continue
 
-        # try to find the corresponding end token after idx
-        search_end_region = out[idx: idx + len(body) + 1000]  # small window for following \end{...}
+        base = env.rstrip('*')
+
+        # Find where to place the label (before \end{<env>} or the closing \])
+        if env == 'brackets' or base == 'displaymath':
+            m_end = re.search(r'\\\]\s*', out[j:j + len(body) + 2000])
+        else:
+            m_end = re.search(r'\\end\{\s*' + re.escape(base) + r'\s*\}', out[j:j + len(body) + 2000])
+
+        end_pos = j + len(body) if not m_end else j + m_end.start()
+        region = out[j:end_pos]
+
+        # If region already has a label/tag, skip
+        if re.search(r'\\label\{', region) or re.search(r'\\tag\{', region):
+            cursor = end_pos
+            continue
+
         lbl = f"{AUTO_LABEL_PREFIX}{i+1}"
         insertion = f"\\label{{{lbl}}}"
-
-        if env == 'brackets':
-            # place label before the closing \]
-            m = re.search(r'\\\]\s*', out[idx: idx + len(body) + 2000])
-            if m:
-                insert_pos = idx + m.start()
-                out = out[:insert_pos] + insertion + out[insert_pos:]
-                auto_labels[i] = lbl
-                cursor = insert_pos + len(insertion)
-                continue
-        else:
-            base = env.rstrip('*')
-            # look for \end{<base>} after the body
-            m_end = re.search(r'\\end\{\s*' + re.escape(base) + r'\s*\}', out[idx: idx + len(body) + 2000])
-            if m_end:
-                insert_pos = idx + m_end.start()
-                out = out[:insert_pos] + insertion + out[insert_pos:]
-                auto_labels[i] = lbl
-                cursor = insert_pos + len(insertion)
-                continue
-
-        # fallback: append the label immediately after the body match
-        insert_pos = idx + len(body)
-        out = out[:insert_pos] + insertion + out[insert_pos:]
+        out = out[:end_pos] + insertion + out[end_pos:]
         auto_labels[i] = lbl
-        cursor = insert_pos + len(insertion)
+        cursor = end_pos + len(insertion)
 
     return out, auto_labels
+
 
 def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30) -> Optional[Dict[str,str]]:
     """Write temp .tex into a temporary directory, run pdflatex once, parse .aux and return label->printed mapping."""
@@ -129,40 +132,61 @@ def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30) -> Optional[Dic
                     mapping[m.group("label")] = m.group("printed")
         return mapping
 
-def map_equations_to_display_names(combined_src: str, eqs: List[Tuple[str,str]]) -> List[Optional[str]]:
-    """
-    Main helper: returns display name (printed) or None for each equation in eqs.
-    eqs is the list produced by your (existing) find_equations(...) -> (env, body) tuples.
-    """
-    temp_src, auto_labels = inject_labels_into_temp_source(combined_src, eqs)
+def _drop_unresolved_inputs(src: str) -> str:
+    return re.sub(r'\\(?:input|include)\{[^}]+\}', '% dropped missing input\n', src)
+
+def _sanitize_for_temp_compile(s: str) -> str:
+    # Drop unresolved inputs/includes (avoid missing files in tmp)
+    s = re.sub(r'\\(?:input|include)\{[^}]+\}', '%<removed-in-temp>', s)
+
+    # Keep only the first \documentclass and \begin{document}
+    def keep_first(pattern, text):
+        hits = list(re.finditer(pattern, text))
+        if not hits:
+            return text
+        first = hits[0]
+        # comment out all but the first occurrence
+        parts = []
+        last = 0
+        for i, m in enumerate(hits):
+            parts.append(text[last:m.start()])
+            parts.append(text[m.start():m.end()] if i == 0 else '%<removed-in-temp>')
+            last = m.end()
+        parts.append(text[last:])
+        return ''.join(parts)
+
+    s = keep_first(r'\\documentclass(?:\[[^\]]*\])?\{[^\}]+\}', s)
+    s = keep_first(r'\\begin\{document\}', s)
+
+    # Remove all \end{document} tokens; add one at end
+    s = re.sub(r'\\end\{document\}', '%<removed-in-temp>', s)
+    if not s.rstrip().endswith(r'\end{document}'):
+        s = s.rstrip() + '\n\\end{document}\n'
+    return s
+
+def map_equations_to_display_names(clean_src: str, eq_dicts: List[Dict]) -> List[Optional[str]]:
+    temp_src, auto_labels = inject_labels_into_temp_source(clean_src, eq_dicts)
+    temp_src = _sanitize_for_temp_compile(temp_src)  # <— important
     label_map = compile_temp_and_parse_aux(temp_src)
     if label_map is None:
-        # compilation failed; return None for all
-        return [None] * len(eqs)
+        return [None] * len(eq_dicts)
 
     results = []
-    for i, (env, body) in enumerate(eqs):
-        # check original snippet for an existing \label (use body location as heuristic)
-        # find snippet in original combined_src
-        pos = combined_src.find(body)
-        snippet = combined_src[pos: pos + len(body)] if pos != -1 else ""
-        m_label = re.search(r'\\label\{([^}]+)\}', snippet)
-        if m_label:
-            lab = m_label.group(1)
-            printed = label_map.get(lab)
-            if printed:
-                results.append(printed)
-                continue
-        # check auto label
+    for i, e in enumerate(eq_dicts):
+        if e["has_tag"]:
+            results.append(e["tag_text"])
+            continue
+
+        # Only trust \label if the env can number (equation/align/gather/multline)
+        if should_label_for_numbering(e["env"]) and e["has_label"] and e["label_name"] in label_map:
+            results.append(label_map[e["label_name"]])
+            continue
+
         auto = auto_labels[i]
         if auto and auto in label_map:
             results.append(label_map[auto])
             continue
-        # explicit tag in body?
-        m_tag = re.search(r'\\tag\{([^}]*)\}', body)
-        if m_tag:
-            results.append(m_tag.group(1))
-            continue
+
         results.append(None)
     return results
 
@@ -314,17 +338,19 @@ def strip_comments_preserve_verbatim(text: str) -> str:
 # ─────────────────────────────────────────────
 #  FIND EQUATIONS (returns (env, body) tuples)
 # ─────────────────────────────────────────────
-
-def find_equations(tex_file):
-    try:
-        with open(tex_file, "r", encoding="utf-8", errors="ignore") as f:
-            tex_content = f.read()
-    except (UnicodeDecodeError, IOError) as e:
-        print(f"Error reading {tex_file}: {e}")
-        return []
-
-    tex_content_clean = strip_comments_preserve_verbatim(tex_content)
-
+def find_equations(clean_tex_text: str):
+    """
+    Find equations in *cleaned* TeX text (comments removed, verbatim preserved).
+    Return list of dicts with keys:
+      - env: 'equation', 'align', 'brackets', ...
+      - raw_body: the exact captured body (before we strip labels/tags)
+      - clean_body: body with labels removed and normalized (same as previous behavior)
+      - start,end: slice indices into the provided clean_tex_text (so callers can inject)
+      - has_label, label_name  (label that was present originally, if any)
+      - has_tag, tag_text      (\tag{...} present in the original body, if any)
+      - is_starred             True if env endswith '*'
+      - chapter_index          1-based chapter number appearing earlier in the doc, or None
+    """
     pattern = re.compile(
         r"""
         \\begin\{(?P<env>equation\*?|align\*?|multline\*?|gather\*?|displaymath)\}
@@ -336,36 +362,70 @@ def find_equations(tex_file):
         re.VERBOSE,
     )
 
-    equations = []
-    for m in pattern.finditer(tex_content_clean):
+    eqs = []
+    # Precompute cumulative chapter indices by scanning for \chapter commands
+    chapter_positions = []
+    for m in re.finditer(r'\\chapter\*?\s*\{', clean_tex_text):
+        # count as a new chapter; position = m.start()
+        chapter_positions.append(m.start())
+
+    for m in pattern.finditer(clean_tex_text):
         if m.group("env"):
-            env, body = m.group("env"), m.group("body")
+            env = m.group("env")
+            raw_body = m.group("body")
+            start = m.start("body")
+            end = m.end("body")
         else:
-            env, body = "brackets", m.group("bracket_body")
+            env = "brackets"
+            raw_body = m.group("bracket_body")
+            start = m.start("bracket_body")
+            end = m.end("bracket_body")
 
-        # 1 strip TeX comments
-        body_clean = re.sub(COMMENT_RE, "", body).strip()
+        # detect starred env
+        is_starred = env.endswith('*')
 
-        # (recommended) also strip labels everywhere
-        body_clean = re.sub(r"\\label\{[^\}]*\}", "", body_clean)
+        # Detect \tag{...} or \label{...} in the raw body (they may be anywhere)
+        m_tag = re.search(r'\\tag\{([^}]*)\}', raw_body)
+        has_tag = bool(m_tag)
+        tag_text = m_tag.group(1) if m_tag else None
 
-        # Normalize blank lines to avoid paragraph breaks inside math
-        body_clean = normalize_equation_body(body_clean)
+        m_label = re.search(r'\\label\{([^}]*)\}', raw_body)
+        has_label = bool(m_label)
+        label_name = m_label.group(1) if m_label else None
 
-        #  quick exit if nothing but comments
+        # Build clean_body (remove labels and strip comments again locally)
+        body_no_labels = re.sub(r'\\label\{[^\}]*\}', '', raw_body)
+        body_no_labels_tags = re.sub(r'\\tag\*?\s*\{[^{}]*\}', '', body_no_labels)
+        body_clean = normalize_equation_body(body_no_labels_tags)
+        body_clean = strip_trailing_punctuation(body_clean)
+
         if not body_clean:
             continue
 
-        #  drop trailing punctuation
-        body_clean = strip_trailing_punctuation(body_clean)
-        
-        # If the ONLY thing left is a \label{…}, treat as empty
-        if not re.sub(r"\\label\{[^\}]*\}", "", body_clean).strip():
-            continue
+        # Determine chapter index: largest chapter_position < start
+        chap_idx = None
+        for i, pos in enumerate(chapter_positions, start=1):
+            if pos < start:
+                chap_idx = i
+            else:
+                break
 
-        equations.append((env, body_clean))
+        eqs.append({
+            "env": env,
+            "raw_body": raw_body,
+            "clean_body": body_clean,
+            "start": start,
+            "end": end,
+            "has_label": has_label,
+            "label_name": label_name,
+            "has_tag": has_tag,
+            "tag_text": tag_text,
+            "is_starred": is_starred,
+            "chapter_index": chap_idx,
+        })
 
-    return equations
+    return eqs
+
 
 def normalize_equation_body(s: str) -> str:
     """Trim empty lines at the start/end and collapse internal blank runs."""
@@ -434,40 +494,36 @@ def extract_relevant_commands(preamble):
 # ─────────────────────────────────────────────
 #  CREATE STANDALONE TEX (starred envs)
 # ─────────────────────────────────────────────
-def create_equation_file(eq_tuple, output_dir, equation_index, relevant_content):
+def create_equation_file(eq_tuple, output_path, relevant_content):
+    """
+    Write a standalone, numberless .tex at output_path for eq_tuple=(env, body).
+    No \tag is inserted; star-envs are used so the output shows no numbers.
+    """
     env, body = eq_tuple
-    eq_tex = '\\documentclass[preview,varwidth]{standalone}\n'
-    # Load packages BEFORE macros so \DeclareMathOperator exists
-    eq_tex += '\\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}\n'
+    base = env.rstrip('*')
+    body = re.sub(r'\\tag\*?\s*\{[^{}]*\}', '', body)
+    
+    parts = []
+    parts.append('\\documentclass[preview,varwidth]{standalone}\n')
+    parts.append('\\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}\n')
     if relevant_content:
-        eq_tex += relevant_content + '\n'
-    eq_tex += '\\begin{document}\n'
+        parts.append(relevant_content + '\n')
+    parts.append('\\begin{document}\n')
 
-    if env == 'brackets':  # \[ ... \]
-        eq_tex += '\\[\n' + body + '\n\\]\n'
+    if env == 'brackets' or base == 'displaymath':
+        # render bracket/displaymath uniformly as \[ ... \]
+        parts.append('\\[\n' + body + '\n\\]\n')
     else:
-        STAR_CAPABLE = {'equation', 'align', 'gather', 'multline'}  # NOT displaymath
-        base = env.rstrip('*')
-        if base in STAR_CAPABLE:
-            star_env = env if env.endswith('*') else env + '*'
-        else:
-            star_env = env  # keep displaymath unstarred
+        # use the *starred* environment to suppress numbering
+        STAR_CAPABLE = {'equation', 'align', 'gather', 'multline'}
+        star_env = (base + '*') if base in STAR_CAPABLE else base
+        parts.append(f'\\begin{{{star_env}}}\n{body}\n\\end{{{star_env}}}\n')
 
-        if not env.endswith('*'):
-            body = re.sub(r'\\label\{.*?\}', '', body)
+    parts.append('\\end{document}\n')
 
-        # Optional: render displaymath using \[ ... \] instead of the environment
-        if base == 'displaymath':
-            eq_tex += '\\[\n' + body + '\n\\]\n'
-        else:
-            eq_tex += f'\\begin{{{star_env}}}\n{body}\n\\end{{{star_env}}}\n'
-
-    eq_tex += '\\end{document}\n'
-
-    tex_path = os.path.abspath(os.path.join(output_dir, f'{equation_index}.tex'))
-    with open(tex_path, 'w', encoding='utf-8') as f:
-        f.write(eq_tex)
-    return tex_path
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(''.join(parts))
+    return output_path
 
 
 def compile_equation(equation_file):
@@ -644,36 +700,37 @@ if __name__ == "__main__":
             print(f"Error reading working file {work_tex_path}: {e}")
             continue
 
+        tex_source_clean = strip_comments_preserve_verbatim(tex_source)
+        equation_dicts = find_equations(tex_source_clean)  # dicts with start/end
+
+        # macros:
+        needed_macros = set().union(*(macros_in_equation(e["clean_body"]) for e in equation_dicts)) if equation_dicts else set()
+
+        # printed names:
+        display_names = map_equations_to_display_names(tex_source_clean, equation_dicts)
+
+        # Optional: drop "0." for pre-chapter equations
+        def _normalize_printed_name_for_prechapter(printed: Optional[str], e: Dict) -> Optional[str]:
+            if printed and e.get("chapter_index") is None:
+                m = re.match(r'^0\.(.+)$', printed)
+                if m:
+                    return m.group(1)
+            return printed
+
+        display_names = [_normalize_printed_name_for_prechapter(n, e)
+                        for e, n in zip(equation_dicts, display_names)]
+        
         m = re.search(r'\\begin{document}', tex_source)
         preamble = tex_source[: m.start()] if m else ""
 
-        # ------ find all equations & which macros they use ----------------
-        equations = find_equations(work_tex_path)
-        print(f"Found {len(equations)} equation environment(s).")
-
-        needed_macros = set().union(*(macros_in_equation(b) for _, b in equations)) if equations else set()
-        print("User-defined macros referenced:", sorted(needed_macros))
-
         relevant_content = collect_definitions(needed_macros, preamble)
-        if relevant_content:
-            print("Copied macro definitions:")
-            print(textwrap.indent(relevant_content, "    "))
-        else:
-            print("No user-defined macro definitions needed.")
-
-        # ------ build every equation --------------------------------------
-        for idx, eq in enumerate(equations, start=1):
-            tex_file = create_equation_file(eq, out_dir, idx, relevant_content)
-            compile_equation(tex_file)
-
-        # ------ set sane perms on *nix (optional) -------------------------
-        if os.name != "nt":
-            for pdf in glob.glob(os.path.join(out_dir, "*.pdf")):
-                try:
-                    os.chmod(pdf, 0o644)
-                except Exception as e:
-                    print("chmod failed:", e)
-
+        # write/compile numberless files, name with printed/tag
+        for idx, (e, dname) in enumerate(zip(equation_dicts, display_names), start=1):
+            fname = make_filename_with_tag(idx, dname)  # e.g., 024_(End).tex or 015_(Var).tex or 010_(unnumbered).tex
+            out_path = os.path.join(out_dir, fname)
+            create_equation_file((e["env"], e["clean_body"]), out_path, relevant_content)  # numberless output
+            compile_equation(out_path)
+            
         # ------ PDF → SVG conversion (skip if Inkscape missing) ----------
         inkscape_exe = find_inkscape()
         if not inkscape_exe:
