@@ -15,9 +15,10 @@ COMMENT_RE = re.compile(r'(^|[^\\])%.*$', re.MULTILINE)   # TeX comment lines
 MACRO_RE = re.compile(r'\\([A-Za-z@]+)')   # skip ctrl-symbols like \&, \%, …
 INCLUDE_RE = re.compile(r'\\(?:input|include)\{([^}]+)\}')
 VERBATIM_ENVS = ("verbatim", "lstlisting", "minted", "Verbatim")
-TIMER_TIMEOUT = 60
+TIMER_TIMEOUT = 30
 AUTO_LABEL_PREFIX = "__ext_eq"
 DEBUG_MODE = True
+
 
 def extract_chapters(clean_text: str):
     """Return list of (pos, title) of \\chapter{...} or \\chapter*{...} in cleaned text."""
@@ -58,60 +59,79 @@ def _normalize_printed_name_for_prechapter(printed: Optional[str], eq_meta: Dict
             return m.group(1)
     return printed
 
-def inject_labels_into_temp_source(clean_text: str, eqs: List[Dict]) -> Tuple[str, List[Optional[str]]]:
-    """
-    Insert \label{__ext_eqN} for equations that can number and don't already
-    have \label or \tag. Works left-to-right using substring search so it’s
-    robust to earlier edits.
-    """
-    out = clean_text
-    auto_labels = [None] * len(eqs)
-    cursor = 0
+# Replace or add these helper functions in your script
 
-    for i, e in enumerate(eqs):
-        env = e["env"]
-        if e.get("is_starred") or not should_label_for_numbering(env):
+def _extract_usepackage_names(src: str) -> List[str]:
+    """Return a flat list of package names referenced by \\usepackage{...} in src."""
+    names = []
+    usepat = re.compile(r'\\usepackage(?:\s*\[[^\]]*\])?\s*\{([^}]*)\}', re.MULTILINE)
+    for m in usepat.finditer(src):
+        pkgs = [p.strip() for p in m.group(1).split(',') if p.strip()]
+        names.extend(pkgs)
+    return names
+
+def _package_exists(pkg_name: str) -> bool:
+    """Return True if kpsewhich finds pkg_name.sty or a local search finds it."""
+    if not pkg_name:
+        return False
+
+    # 1) kpsewhich check
+    kpsewhich = shutil.which("kpsewhich")
+    if kpsewhich:
+        try:
+            p = subprocess.run([kpsewhich, f"{pkg_name}.sty"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, timeout=5)
+            if p.stdout and p.stdout.strip():
+                return True
+        except Exception:
+            # fall through to local search
+            pass
+
+    # 2) search in TEXINPUTS (if set) and working dir, and upward parents — covers common setups
+    search_paths = []
+
+    # TEXINPUTS environment variable (colon/semicolon separated)
+    texinputs = os.environ.get("TEXINPUTS")
+    if texinputs:
+        search_paths.extend([p for p in texinputs.split(os.pathsep) if p])
+
+    # current working directory and parent chain up to filesystem root
+    cwd = os.getcwd()
+    search_paths.append(cwd)
+    # also include the script dir
+    try:
+        search_paths.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+
+    # Walk each path looking for "<pkg_name>.sty"
+    target = f"{pkg_name}.sty"
+    for base in search_paths:
+        if not base:
             continue
-        if e.get("has_label") or e.get("has_tag"):
-            # Respect explicit \label or \tag
-            continue
+        # if the path is a single file path, check directly
+        candidate = os.path.join(base, target)
+        if os.path.exists(candidate):
+            return True
+        # otherwise do a shallow walk (avoid huge recursion)
+        for root, dirs, files in os.walk(base):
+            if target in files:
+                return True
+            # limit depth: avoid extremely deep scans
+            # stop walking deeper than a few levels
+            # (we rely on kpsewhich for system-wide, local repos are often shallow)
+            # No explicit break here — os.walk won't tell depth; rely on typical directory layouts.
 
-        body = e["clean_body"]
-        j = out.find(body, cursor)
-        if j == -1:
-            # fallback: try from the beginning (handles duplicates OK-ish)
-            j = out.find(body)
-            if j == -1:
-                continue
+    # not found
+    return False
 
-        base = env.rstrip('*')
-
-        # Find where to place the label (before \end{<env>} or the closing \])
-        if env == 'brackets' or base == 'displaymath':
-            m_end = re.search(r'\\\]\s*', out[j:j + len(body) + 2000])
-        else:
-            m_end = re.search(r'\\end\{\s*' + re.escape(base) + r'\s*\}', out[j:j + len(body) + 2000])
-
-        end_pos = j + len(body) if not m_end else j + m_end.start()
-        region = out[j:end_pos]
-
-        # If region already has a label/tag, skip
-        if re.search(r'\\label\{', region) or re.search(r'\\tag\{', region):
-            cursor = end_pos
-            continue
-
-        lbl = f"{AUTO_LABEL_PREFIX}{i+1}"
-        insertion = f"\\label{{{lbl}}}"
-        out = out[:end_pos] + insertion + out[end_pos:]
-        auto_labels[i] = lbl
-        cursor = end_pos + len(insertion)
-
-    return out, auto_labels
 
 def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30, debug_dir: Optional[str] = None) -> Optional[Dict[str,str]]:
     """
     Compile temp_src with pdflatex and parse the .aux for \\newlabel mappings.
-    If debug_dir is provided, write temp_for_labels.tex/.pdf/.aux/.log there and keep them.
+    If missing packages are detected, create minimal stub .sty files in the temp dir
+    so pdflatex will not error out on missing package.
     """
     tex_engine = shutil.which("pdflatex") or "pdflatex"
 
@@ -125,11 +145,43 @@ def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30, debug_dir: Opti
         tmpdir = tmpdir_cm.__enter__()
 
     try:
+        # Create temp tex file
         tex_name = "temp_for_labels.tex"
         tex_path = os.path.join(tmpdir, tex_name)
+
+        # detect usepackage names and missing packages BEFORE writing file,
+        # so we can add stubs into tmpdir
+        pkgs = _extract_usepackage_names(temp_src)
+        missing = [p for p in pkgs if not _package_exists(p)]
+
+        if missing and debug_dir:
+            print(f"[debug] Missing packages (will create stubs): {missing}")
+        elif missing:
+            print(f"[debug] Missing packages detected: {missing} (creating stubs in tmpdir)")
+
+        # create tiny stubs for missing packages in tmpdir so pdflatex will find them
+        for p in missing:
+            try:
+                stub_path = os.path.join(tmpdir, f"{p}.sty")
+                # only create if doesn't already exist
+                if not os.path.exists(stub_path):
+                    with open(stub_path, "w", encoding="utf-8") as sf:
+                        sf.write(f"%% stub created by tex2svg for missing package {p}\n")
+                        sf.write(f"\\ProvidesPackage{{{p}}}[2025/01/01 stub]\n")
+                        # minimal safe defaults: don't override user macros, just stop processing
+                        sf.write("% Add minimal safe definitions here if needed by your equations\n")
+                        sf.write("\\endinput\n")
+                    if debug_dir:
+                        print(f"[debug] Stub written: {stub_path}")
+            except Exception as ex:
+                if debug_dir:
+                    print(f"[debug] Failed creating stub for {p}: {ex}")
+
+        # Now write the temp tex into tmpdir
         with open(tex_path, "w", encoding="utf-8") as f:
             f.write(temp_src)
 
+        # Run pdflatex inside tmpdir
         cmd = [
             tex_engine,
             "-interaction=nonstopmode",
@@ -148,7 +200,7 @@ def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30, debug_dir: Opti
                     lf.write(b"pdflatex timeout\n")
             return None
 
-        # Always save output logs if debugging
+        # Save logs if debugging
         if debug_dir:
             with open(os.path.join(tmpdir, "compile_stdout.log"), "wb") as lf:
                 lf.write(proc.stdout or b"")
@@ -187,67 +239,109 @@ def compile_temp_and_parse_aux(temp_src: str, timeout: int = 30, debug_dir: Opti
         if tmpdir_cm:
             tmpdir_cm.__exit__(None, None, None)
 
+# ------------------ new helper: build a minimal doc for numbering ------------------
+def _extract_preamble_and_body(src: str) -> Tuple[str,str]:
+    """Return (preamble, body) splitting at \\begin{document} (works on cleaned src)."""
+    m = re.search(r'\\begin\{document\}', src)
+    if not m:
+        return src, ""
+    return src[:m.start()], src[m.end():]
 
-def _sanitize_for_temp_compile(s: str) -> str:
-    # Drop unresolved inputs/includes (avoid missing files in tmp)
-    s = re.sub(r'\\(?:input|include)\{[^}]+\}', '%<removed-in-temp>', s)
+def _collect_usepackages(preamble: str) -> List[str]:
+    """Return non-commented \\usepackage[...]{} lines from the preamble (keeps options)."""
+    return re.findall(r'(?m)^(?!\s*%)(\\usepackage(?:\[[^\]]*\])?\{[^\}]+\})', preamble)
 
-    # Keep only the first \documentclass and \begin{document}
-    def keep_first(pattern, text):
-        hits = list(re.finditer(pattern, text))
-        if not hits:
-            return text
-        first = hits[0]
-        # comment out all but the first occurrence
-        parts = []
-        last = 0
-        for i, m in enumerate(hits):
-            parts.append(text[last:m.start()])
-            parts.append(text[m.start():m.end()] if i == 0 else '%<removed-in-temp>')
-            last = m.end()
-        parts.append(text[last:])
-        return ''.join(parts)
+def _find_numberwithin(preamble: str) -> Optional[str]:
+    """Return the \\numberwithin{equation}{...} line if present, else None."""
+    m = re.search(r'(?m)^(?!\s*%)(\\numberwithin\{equation\}\{[^\}]+\})', preamble)
+    return m.group(1) if m else None
 
-    s = keep_first(r'\\documentclass(?:\[[^\]]*\])?\{[^\}]+\}', s)
-    s = keep_first(r'\\begin\{document\}', s)
 
-    # Remove all \end{document} tokens; add one at end
-    s = re.sub(r'\\end\{document\}', '%<removed-in-temp>', s)
-    if not s.rstrip().endswith(r'\end{document}'):
-        s = s.rstrip() + '\n\\end{document}\n'
-    return s
+def build_minimal_numbering_doc(clean_src: str, eqs: List[Dict]) -> str:
+    """
+    Build a tiny .tex that uses the SAME header as create_equation_file
+    (standalone + ams* packages), but still reproduces chapter-based numbering.
 
-def map_equations_to_display_names(clean_src: str, eq_dicts: List[Dict], debug_dir: Optional[str] = None) -> List[Optional[str]]:
-    temp_src, auto_labels = inject_labels_into_temp_source(clean_src, eq_dicts)
-    temp_src = _sanitize_for_temp_compile(temp_src)
-    label_map = compile_temp_and_parse_aux(temp_src, debug_dir=debug_dir)
+    - No original preamble is imported.
+    - Chapters are simulated (define a 'chapter' counter) and stepped where they appear.
+    - One \begin{equation}...\end{equation} shell per *numberable* environment,
+      labeled to read the printed numbers from the AUX.
+    """
+    # Detect if the source actually contains chapters
+    has_chapters = bool(re.search(r'\\chapter\*?\s*\{', clean_src)) or any(e.get("chapter_index") for e in eqs)
+
+    parts = []
+    # --- SAME header as standalone equations ---
+    parts.append(r'\documentclass[preview,varwidth]{standalone}' + '\n')
+    parts.append(r'\usepackage{amsmath,amssymb,amsfonts,mathtools,amsthm}' + '\n')
+
+    # Simulate chapters under 'standalone'
+    if has_chapters:
+        parts.append(r'\newcounter{chapter}' + '\n')
+        # amsmath’s \numberwithin wires equation to chapter
+        parts.append(r'\numberwithin{equation}{chapter}' + '\n')
+
+    parts.append(r'\begin{document}' + '\n')
+
+    # Chapter markers: step the simulated chapter counter at the right places
+    chapter_positions = [m.start() for m in re.finditer(r'\\chapter\*?\s*\{', clean_src)]
+    chap_iter = iter(chapter_positions)
+    next_chap_pos = next(chap_iter, None)
+
+    # Interleave chapter steps and equation shells in source order
+    eqs_sorted = sorted(eqs, key=lambda e: e['start'])
+
+    for i, e in enumerate(eqs_sorted, start=1):
+        # Step chapter counter before this equation if needed
+        while has_chapters and next_chap_pos is not None and next_chap_pos < e['start']:
+            parts.append(r'\stepcounter{chapter}' + '\n')  # resets equation via \numberwithin
+            next_chap_pos = next(chap_iter, None)
+
+        # Only emit shells for numberable (non-starred) environments
+        if not e.get("is_starred") and should_label_for_numbering(e["env"]):
+            lbl = e["label_name"] if e.get("has_label") else f"{AUTO_LABEL_PREFIX}{i}"
+            parts.append(r'\begin{equation}\relax' + '\n')
+            parts.append(fr'\label{{{lbl}}}' + '\n')
+            parts.append(r'\end{equation}' + '\n')
+
+    # Any remaining chapters after the last equation (harmless, optional)
+    while has_chapters and next_chap_pos is not None:
+        parts.append(r'\stepcounter{chapter}' + '\n')
+        next_chap_pos = next(chap_iter, None)
+
+    parts.append(r'\end{document}' + '\n')
+    return ''.join(parts)
+
+def map_equations_to_display_names(clean_src, eq_dicts, debug_dir=None):
+    temp_src = build_minimal_numbering_doc(clean_src, eq_dicts)
+    label_map = compile_temp_and_parse_aux(temp_src, timeout=TIMER_TIMEOUT, debug_dir=debug_dir)
 
     if label_map is None:
-        print("[debug] label_map is None → all names will be 'unnumbered'.")
         return [None] * len(eq_dicts)
 
+    # ... then same logic as before to choose printed names
     results = []
     for i, e in enumerate(eq_dicts):
-        reason = None
         if e["has_tag"]:
             results.append(e["tag_text"])
-            reason = f"eq#{i+1}: used explicit \\tag{{...}} → '{e['tag_text']}'"
-        elif should_label_for_numbering(e["env"]) and e["has_label"] and e["label_name"] in label_map:
+            continue
+        if should_label_for_numbering(e["env"]) and e["has_label"] and e["label_name"] in label_map:
             results.append(label_map[e["label_name"]])
-            reason = f"eq#{i+1}: used existing \\label{{{e['label_name']}}} → '{label_map[e['label_name']]}'"
-        else:
-            auto = auto_labels[i]
-            if auto and auto in label_map:
-                results.append(label_map[auto])
-                reason = f"eq#{i+1}: used auto label {auto} → '{label_map[auto]}'"
-            else:
-                results.append(None)
-                reason = f"eq#{i+1}: no tag/label and not numberable or missing in AUX → unnumbered"
-
-        if debug_dir:
-            print("[debug]", reason)
-
+            continue
+        auto = f"{AUTO_LABEL_PREFIX}{i+1}"
+        if auto in label_map:
+            results.append(label_map[auto])
+            continue
+        results.append(None)
+        
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(os.path.join(debug_dir, "numbering_skeleton.tex"), "w", encoding="utf-8") as f:
+            f.write(temp_src)
+            
     return results
+
+
 
 
 def strip_comments(text: str) -> str:
@@ -761,17 +855,17 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error reading working file {work_tex_path}: {e}")
             continue
-
+                
         tex_source_clean = strip_comments_preserve_verbatim(tex_source)
-
-        # Chapter detection debug (from cleaned text)
-        chapters = extract_chapters(tex_source_clean)
-        if chapters:
-            print(f"[debug] Chapters found: {len(chapters)} → {[t for _, t in chapters]}")
-        else:
-            print("[debug] No \\chapter{...} found in cleaned source.")
-
         equation_dicts = find_equations(tex_source_clean)
+        chapters = extract_chapters(tex_source_clean)
+
+        # split preamble from the original full source (not cleaned)
+        m = re.search(r'\\begin{document}', tex_source)
+        preamble = tex_source[:m.start()] if m else ""
+
+        # Get printed names by compiling the harvest doc once
+        display_names = map_equations_to_display_names(tex_source_clean, equation_dicts, debug_dir)
 
         # Quick per-eq debug line
         for i, e in enumerate(equation_dicts, 1):
@@ -782,10 +876,7 @@ if __name__ == "__main__":
 
         # macros:
         needed_macros = set().union(*(macros_in_equation(e["clean_body"]) for e in equation_dicts)) if equation_dicts else set()
-
-        # printed names:
-        display_names = map_equations_to_display_names(tex_source_clean, equation_dicts, debug_dir=debug_dir)
-
+        
         # Optional: drop "0." for pre-chapter equations
         def _normalize_printed_name_for_prechapter(printed: Optional[str], e: Dict) -> Optional[str]:
             if printed and e.get("chapter_index") is None:
